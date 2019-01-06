@@ -1,0 +1,289 @@
+---
+title: "NYC Apartment Sales Bayesian Regression Modeling"
+author: "Joo Kim"
+date: "11/24/2018"
+output: pdf_document
+---
+
+## Load libraries 
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+library(dplyr) 
+library(ggplot2)
+library(ggthemes)
+library(rstanarm)
+library(rlang)
+library(stringr)
+library(lubridate)
+library(loo)
+library(bayesplot)
+
+options(mc.cores = parallel::detectCores())
+```
+
+## Read and combine data 
+
+```{r warning=FALSE, message=FALSE, echo=TRUE, results='hide', eval=FALSE}
+# read data 
+bronx <- read.csv("bronx.csv")
+brooklyn <- read.csv("brooklyn.csv")
+manhattan <- read.csv("manhattan.csv")
+queens <- read.csv("queens.csv")
+staten_island <- read.csv("statenisland.csv")
+
+# match variable class for combining 
+class_match <- function(data, num_vars, char_vars, price_vars, date_vars) {
+  matched_data <- 
+    data %>% 
+    mutate_at(vars(num_vars), as.numeric) %>% 
+    mutate_at(vars(char_vars), as.character) %>% 
+    mutate_at(vars(price_vars), funs(as.numeric(gsub('[$,]', '', .)))) %>%
+    mutate_at(vars(date_vars), funs(as.POSIXct(strptime(., "%m/%d/%y"))))
+  
+  return(matched_data)
+}
+
+num_vars <- 
+  bronx %>% 
+  select(BOROUGH, RESIDENTIAL.UNITS, COMMERCIAL.UNITS, TOTAL.UNITS, 
+         LAND.SQUARE.FEET, GROSS.SQUARE.FEET, YEAR.BUILT)
+num_vars <- names(num_vars)
+
+char_vars <- 
+  bronx %>% 
+  select(ZIP.CODE, ADDRESS, APARTMENT.NUMBER, 
+         BUILDING.CLASS.AT.TIME.OF.SALE, SALE.PRICE, SALE.DATE)
+char_vars <- names(char_vars)
+
+price_vars <- 
+  bronx %>% 
+  select(SALE.PRICE)
+price_vars <- names(price_vars)
+
+date_vars <- 
+  bronx %>% 
+  select(SALE.DATE)
+date_vars <- names(date_vars)
+
+bronx <- class_match(bronx, num_vars, char_vars, price_vars, date_vars)
+brooklyn <- class_match(brooklyn, num_vars, char_vars, price_vars, date_vars)
+manhattan <- class_match(manhattan, num_vars, char_vars, price_vars, date_vars)
+queens <- class_match(queens, num_vars, char_vars, price_vars, date_vars)
+staten_island <- class_match(staten_island, num_vars, char_vars, price_vars, date_vars)
+```
+
+```{r echo=TRUE, results='hide', warning=FALSE, message=FALSE, eval=FALSE}
+# create a dataframe & filter only whole residential buildings 
+df <- 
+  bind_rows(bronx, brooklyn, manhattan, queens, staten_island) %>% 
+  mutate(borough = case_when(
+    BOROUGH == 1 ~ "manhattan",
+    BOROUGH == 2 ~ "bronx",
+    BOROUGH == 3 ~ "brooklyn",
+    BOROUGH == 4 ~ "queens",
+    BOROUGH == 5 ~ "staten island", 
+    TRUE ~ NA_character_
+  )) %>% 
+  filter(APARTMENT.NUMBER == " " & 
+           !str_detect(ADDRESS, "[,]") & 
+           !BUILDING.CLASS.AT.TIME.OF.SALE %in% 
+           c(" R1 ", " R2 ", " R3 ", " R4 ", " R6 ", " R7 ", " R8 ") &
+           str_detect(BUILDING.CLASS.AT.TIME.OF.SALE, "[ABCDR]"))
+```
+
+## Quick exploratory data analysis 
+
+```{r echo=TRUE, results='hide', eval=FALSE}
+# quick count of observations by borough
+n_borough <- 
+  df %>% 
+  group_by(borough) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count))
+n_borough
+```
+
+```{r echo=TRUE, results='hide', message=FALSE, warning=FALSE, eval=FALSE}
+# information on outcome, property sales price
+range(df$SALE.PRICE, na.rm = TRUE)
+quantile(df$SALE.PRICE, na.rm = TRUE)
+median(df$SALE.PRICE, na.rm = TRUE)
+mean(df$SALE.PRICE, na.rm = TRUE) # tells me that right skewed when mean > median 
+
+sum(is.na(df$SALE.PRICE))
+sum(is.na(df$SALE.PRICE)) / nrow(df) 
+```
+
+```{r message=FALSE, warning=FALSE, fig.show="hide", eval=FALSE}
+ggplot(df) + 
+  geom_freqpoly(aes(SALE.PRICE), binwidth = 1000) +
+  labs(title = "Overall distribution of building sale price",
+       x = "Price in hundred thousands",
+       y = "Count") + 
+  scale_x_continuous(breaks = c(0, 100000000, 200000000, 300000000, 400000000),
+                     labels = c("$0", "$100", "$200", "$300", "$400")) +
+  theme_tufte()
+
+ggplot(df) + 
+  geom_freqpoly(aes(SALE.PRICE), binwidth = 1000) +
+  labs(title = "Distribution of building sale price",
+       x = "Price in hundred thousands",
+       y = "Count") + 
+  scale_x_continuous(breaks = c(0, 100000000, 200000000, 300000000, 400000000),
+                     labels = c("$0", "$100", "$200", "$300", "$400")) +
+  facet_wrap(~borough, ncol = 2) +
+  theme_tufte()
+
+ggplot(df) +
+  geom_boxplot(aes(borough, SALE.PRICE)) +
+  labs(title = "Distribution of building sale price by borough",
+       x = "borough",
+       y = "Price in hundred thousands") + 
+  scale_y_continuous(breaks = c(0, 100000000, 200000000, 300000000, 400000000),
+                     labels = c("$0", "$100", "$200", "$300", "$400")) +
+  theme_tufte()
+```
+
+```{r echo=TRUE, results='hide', eval=FALSE, message=FALSE, warning=FALSE}
+# range & histogram of land and gross square footage variables 
+range(df$LAND.SQUARE.FEET)
+range(df$GROSS.SQUARE.FEET)
+
+# year built
+range(df$YEAR.BUILT)
+no_zero <- 
+  df %>% filter(YEAR.BUILT != 0)
+range(no_zero$YEAR.BUILT) # 1800 to 2018
+```
+
+```{r echo=TRUE, results='hide', eval=FALSE, message=FALSE, warning=FALSE}
+# pick variables of interest 
+df <- 
+  df %>% 
+  select(TOTAL.UNITS, LAND.SQUARE.FEET, GROSS.SQUARE.FEET, 
+         YEAR.BUILT, SALE.PRICE, borough)
+
+# remove unreasonable values and standardize land square and gross square variables
+df <- 
+  df %>% 
+  filter(LAND.SQUARE.FEET >= 100 & GROSS.SQUARE.FEET >= 100) %>% 
+  mutate(land_z = (LAND.SQUARE.FEET - mean(LAND.SQUARE.FEET))/sd(LAND.SQUARE.FEET),
+         gross_z = (GROSS.SQUARE.FEET - mean(GROSS.SQUARE.FEET))/sd(GROSS.SQUARE.FEET))
+
+# year built
+df <- 
+  df %>% 
+  filter(YEAR.BUILT > 0) %>% # ~ 0.02% of the data
+  mutate(years_since = (2018 - YEAR.BUILT)) 
+
+# center unit variable
+df <- 
+  df %>% 
+  mutate(units_c = TOTAL.UNITS - mean(TOTAL.UNITS))
+```
+
+## Select variables of interest
+
+```{r echo=TRUE, results='hide', eval=FALSE, message=FALSE, warning=FALSE}
+# final dataset with NA values
+df_final <- 
+  df %>%
+  select(SALE.PRICE, borough, land_z, gross_z, units_c, years_since) %>%
+  rename(price = SALE.PRICE) %>%
+  mutate_if(is.character, as.factor)
+```
+
+## Deterministic imputation
+
+```{r impute, cache=TRUE, echo=TRUE, results='hide', eval=FALSE, message=FALSE, warning=FALSE}
+# fit a regression model to impute missing values for price 
+df_predictors <- 
+  df_final %>%
+  select(-price)
+impute_price <- stan_glm(log(price) ~ ., data = df_final)
+
+pred_price <- colMeans(posterior_predict(impute_price, newdata = df_predictors))
+
+# function for imputing data 
+impute <- function(x, x_impute) {
+  price_vect <- ifelse(is.na(x), x_impute, log(x)) # logging price 
+  
+  return(price_vect)
+}
+price_log <- impute(df_final$price, pred_price)
+
+df_final <- 
+  cbind(df_final, price_log) %>% 
+  select(-price)
+```
+
+## Fitting models 
+
+### Simple model 
+
+```{r simple, cache=TRUE, echo=TRUE, results='hide', eval=FALSE}
+fit_simple <- stan_glm(price_log ~ ., data = df_final)
+```
+
+```{r echo=TRUE, results='hide', eval=FALSE}
+fit_simple
+fit_simple$coefficients
+fit_simple$ses
+```
+
+```{r fig.show="hide", eval=FALSE}
+plot(fit_simple, regex_pars = "(Intercept)")
+plot(fit_simple, regex_pars = "^borough")
+plot(fit_simple, regex_pars = c("land_z", "gross_z", "units_c", "years_since"))
+```
+
+```{r interaction, cache=TRUE, echo=TRUE, results='hide', eval=FALSE}
+fit_interaction_land_borough <- stan_glm(price_log ~ . + land_z:borough, data = df_final)
+```
+
+### Interaction model
+
+```{r echo=TRUE, results='hide', eval=FALSE}
+fit_interaction_land_borough
+fit_interaction_land_borough$coefficients
+fit_interaction_land_borough$ses
+```
+
+```{r fig.show="hide", eval=FALSE}
+plot(fit_interaction_land_borough, regex_pars = ":")
+```
+
+## Model checking and fit
+
+### Comparing simulated data with real data
+
+```{r predict, cache=TRUE, echo=TRUE, results='hide', eval=FALSE}
+y <- posterior_predict(fit_interaction_land_borough)
+n_sims <- nrow(y)
+sub <- sample(n_sims, 500) 
+ppc_dens_overlay(df_final$price_log, y[sub, ])
+```
+
+### Measuring difference in pricing by borough with simulated data
+
+```{r, echo=TRUE, results='hide', eval=FALSE}
+# create two new datasets 
+df_manhattan <- 
+  df_final %>% 
+  filter(borough == "manhattan" & price_log >= 17.5) %>%
+  select(-price_log) 
+
+df_queens <- df_manhattan
+df_queens$borough <- "queens" 
+
+manhattan_pred <- posterior_predict(fit_interaction_land_borough, newdata = df_manhattan)
+queens_pred <- posterior_predict(fit_interaction_land_borough, newdata = df_queens)
+```
+
+```{r, fig.show="hide", eval=FALSE}
+hist(manhattan_pred - queens_pred,
+     main = "Difference in building price of Manhattan and Queens",
+     xlab = "Price (in log)",
+     ylab = "")
+```
+
